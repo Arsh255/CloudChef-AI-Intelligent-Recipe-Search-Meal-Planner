@@ -1,0 +1,405 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudChef Backend with Cognito + Serverless API + Proxy Integration + Global CORS (Groq Version)"
+
+Parameters:
+  GroqApiKey:
+    Type: String
+    NoEcho: true
+    Description: "Groq API Key"
+
+Resources:
+
+  ###########################################################
+  # VPC Creation (New Section)
+  ###########################################################
+  
+  CloudChefVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: CloudChefVPC
+
+  CloudChefPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CloudChefVPC
+      CidrBlock: "10.0.1.0/24"
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: CloudChefPublicSubnet
+
+  CloudChefPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CloudChefVPC
+      CidrBlock: "10.0.2.0/24"
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: CloudChefPrivateSubnet
+
+  CloudChefInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: CloudChefInternetGateway
+
+  CloudChefVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref CloudChefVPC
+      InternetGatewayId: !Ref CloudChefInternetGateway
+
+  ###########################################################
+  # COGNITO USER POOL (Existing Section)
+  ###########################################################
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: "CloudChefUserPool"
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+          RequireLowercase: false
+          RequireUppercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: CloudChefFrontendClient
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - "http://localhost:5173"
+      LogoutURLs:
+        - "http://localhost:5173"
+
+  CognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: cloudchef-arshad
+      UserPoolId: !Ref CognitoUserPool
+
+  ###########################################################
+  # API GATEWAY + AUTHORIZER (Existing Section)
+  ###########################################################
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CloudChefApi
+
+  ApiRootResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: api
+
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      RestApiId: !Ref ApiGateway
+      Type: COGNITO_USER_POOLS
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+      IdentitySource: "method.request.header.Authorization"
+
+  ###########################################################
+  # DYNAMODB TABLES (Existing Section)
+  ###########################################################
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CloudChefUsers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  RecipesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CloudChefRecipes
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recipeId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recipeId
+          KeyType: HASH
+
+  MealPlansTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CloudChefMealPlans
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: weekId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: weekId
+          KeyType: RANGE
+
+  GroceryListsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CloudChefGroceryLists
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: listId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: listId
+          KeyType: RANGE
+
+  ###########################################################
+  # LAMBDAS (UPDATED FOR VPC)
+  ###########################################################
+
+  SearchLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SearchRecipesFunction
+      Runtime: python3.11
+      Handler: app.lambda_handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !Ref CloudChefPrivateSubnet
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          GROQ_API_KEY: !Ref GroqApiKey
+          RECIPES_TABLE: CloudChefRecipes
+      Code:
+        S3Bucket: cloudchef-lambda
+        S3Key: lambda/search.zip
+
+  MealPlanLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GenerateMealPlanFunction
+      Runtime: python3.11
+      Handler: app.lambda_handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !Ref CloudChefPrivateSubnet
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          GROQ_API_KEY: !Ref GroqApiKey
+          USERS_TABLE: CloudChefUsers
+          RECIPES_TABLE: CloudChefRecipes
+          MEALPLANS_TABLE: CloudChefMealPlans
+      Code:
+        S3Bucket: cloudchef-lambda
+        S3Key: lambda/mealplan.zip
+
+  PreferencesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserPreferencesFunction
+      Runtime: python3.11
+      Handler: app.lambda_handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !Ref CloudChefPrivateSubnet
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          USERS_TABLE: CloudChefUsers
+      Code:
+        S3Bucket: cloudchef-lambda
+        S3Key: lambda/preferences.zip
+
+  GroceryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GenerateGroceryListFunction
+      Runtime: python3.11
+      Handler: app.lambda_handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !Ref CloudChefPrivateSubnet
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          MEALPLANS_TABLE: CloudChefMealPlans
+          RECIPES_TABLE: CloudChefRecipes
+          GROCERY_TABLE: CloudChefGroceryLists
+      Code:
+        S3Bucket: cloudchef-lambda
+        S3Key: lambda/grocery.zip
+
+  ###########################################################
+  # LAMBDA PERMISSIONS (Existing Section)
+  ###########################################################
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Lambda functions"
+      VpcId: !Ref CloudChefVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: "0.0.0.0/0"
+
+  ###########################################################
+  # API ENDPOINTS (Existing Section)
+  ###########################################################
+
+  # SEARCH
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ApiRootResource
+      PathPart: search
+
+  SearchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SearchResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchLambda.Arn}/invocations
+
+  # MEALPLAN
+  MealPlanResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ApiRootResource
+      PathPart: mealplan
+
+  MealPlanMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref MealPlanResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MealPlanLambda.Arn}/invocations
+
+  # PREFERENCES
+  PreferencesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ApiRootResource
+      PathPart: preferences
+
+  PreferencesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref PreferencesResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PreferencesLambda.Arn}/invocations
+
+  # GROCERY
+  GroceryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ApiRootResource
+      PathPart: grocery
+
+  GroceryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref GroceryResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GroceryLambda.Arn}/invocations
+
+  ###########################################################
+  # DEPLOYMENT (Existing Section)
+  ###########################################################
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SearchMethod
+      - MealPlanMethod
+      - PreferencesMethod
+      - GroceryMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+Outputs:
+  ApiUrl:
+    Description: "Invoke URL"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/api"
